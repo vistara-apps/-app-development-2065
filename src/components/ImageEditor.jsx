@@ -1,93 +1,203 @@
-import React, { useState, useRef } from 'react'
-import { Upload, Download, Share2, Trash2, Eye, EyeOff, Sparkles, Image as ImageIcon, Grid, Sliders } from 'lucide-react'
-import Button from './ui/Button'
-import ImageUploader from './ImageUploader'
-import EditPanel from './EditPanel'
-import BatchEditor from './BatchEditor'
+import React, { useState, useEffect } from 'react';
+import { Upload, Download, Share2, Trash2, Eye, EyeOff, Sparkles, Image as ImageIcon, Grid, Sliders } from 'lucide-react';
+import { useAuth } from '../context/AuthContext';
+import Button from './ui/Button';
+import ImageUploader from './ImageUploader';
+import EditPanel from './EditPanel';
+import BatchEditor from './BatchEditor';
+import SocialShare from './SocialShare';
+import Upscaler from './advanced/Upscaler';
+import SmartCrop from './advanced/SmartCrop';
+import ErrorMessage from './common/ErrorMessage';
+import imageProcessingService from '../services/imageProcessing';
+import storageService from '../services/storage';
+import errorHandlingService from '../services/errorHandling';
 
-const ImageEditor = ({ user, onUpgrade, onLogin }) => {
-  const [images, setImages] = useState([])
-  const [selectedImage, setSelectedImage] = useState(null)
-  const [activeTab, setActiveTab] = useState('single')
-  const [isProcessing, setIsProcessing] = useState(false)
+const ImageEditor = ({ onUpgrade, onLogin }) => {
+  const { user } = useAuth();
+  const [images, setImages] = useState([]);
+  const [selectedImage, setSelectedImage] = useState(null);
+  const [activeTab, setActiveTab] = useState('single');
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [error, setError] = useState(null);
+  const [activeAdvancedTool, setActiveAdvancedTool] = useState(null);
 
-  const handleImageUpload = (uploadedImages) => {
-    const newImages = uploadedImages.map((file, index) => ({
-      id: Date.now() + index,
-      file,
-      url: URL.createObjectURL(file),
-      name: file.name,
-      originalUrl: URL.createObjectURL(file),
-      editedUrl: null,
-      edits: []
-    }))
-    
-    setImages(prev => [...prev, ...newImages])
-    if (newImages.length === 1) {
-      setSelectedImage(newImages[0])
+  // Check if user has edits remaining
+  const hasEditsRemaining = () => {
+    if (!user) return false;
+    if (user.subscriptionTier !== 'free') return true;
+    return user.editsRemaining > 0;
+  };
+
+  const handleImageUpload = async (uploadedImages) => {
+    try {
+      const newImages = [];
+      
+      for (const file of uploadedImages) {
+        // Create a local preview immediately
+        const localPreview = {
+          id: Date.now() + Math.random(),
+          file,
+          url: URL.createObjectURL(file),
+          name: file.name,
+          originalUrl: URL.createObjectURL(file),
+          editedUrl: null,
+          edits: []
+        };
+        
+        newImages.push(localPreview);
+        
+        // If user is logged in, upload to storage
+        if (user) {
+          try {
+            // Upload to storage in the background
+            const uploadResult = await storageService.uploadImage(file, {
+              title: file.name
+            });
+            
+            // Update the image with the storage URL
+            const updatedImage = {
+              ...localPreview,
+              id: uploadResult.image.id,
+              url: uploadResult.image.url,
+              originalUrl: uploadResult.image.url
+            };
+            
+            // Replace the local preview with the uploaded image
+            setImages(prev => prev.map(img => 
+              img.id === localPreview.id ? updatedImage : img
+            ));
+          } catch (err) {
+            console.error('Image upload error:', err);
+            // Keep the local preview if upload fails
+          }
+        }
+      }
+      
+      setImages(prev => [...prev, ...newImages]);
+      if (newImages.length === 1) {
+        setSelectedImage(newImages[0]);
+      }
+    } catch (err) {
+      const errorObj = errorHandlingService.handleUploadError(err);
+      setError(errorObj);
     }
-  }
+  };
 
   const handleEditApply = async (editType, settings) => {
-    if (!selectedImage) return
+    if (!selectedImage) return;
+
+    // Check authentication
+    if (!user) {
+      onLogin();
+      return;
+    }
 
     // Check subscription limits
-    if (!user) {
-      onLogin()
-      return
+    if (!hasEditsRemaining()) {
+      onUpgrade();
+      return;
     }
 
-    if (user.subscriptionTier === 'free' && user.editsRemaining <= 0) {
-      onUpgrade()
-      return
+    setIsProcessing(true);
+    setProgress(0);
+    setError(null);
+    
+    try {
+      let result;
+      
+      // Process the image based on edit type
+      switch (editType) {
+        case 'remove-bg':
+          result = await imageProcessingService.removeBackground(
+            selectedImage.file,
+            settings,
+            setProgress
+          );
+          break;
+        case 'enhance':
+          result = await imageProcessingService.enhanceImage(
+            selectedImage.file,
+            settings,
+            setProgress
+          );
+          break;
+        case 'filter':
+          result = await imageProcessingService.applyFilter(
+            selectedImage.file,
+            settings.filterId,
+            settings,
+            setProgress
+          );
+          break;
+        case 'adjustments':
+          result = await imageProcessingService.applyAdjustments(
+            selectedImage.file,
+            settings,
+            {},
+            setProgress
+          );
+          break;
+        default:
+          throw new Error(`Unknown edit type: ${editType}`);
+      }
+      
+      // Update the image with the processed result
+      const editedImage = {
+        ...selectedImage,
+        editedUrl: result.url || selectedImage.originalUrl, // Fallback to original if no URL
+        edits: [...selectedImage.edits, { type: editType, settings, timestamp: Date.now() }]
+      };
+      
+      setImages(prev => prev.map(img => 
+        img.id === selectedImage.id ? editedImage : img
+      ));
+      setSelectedImage(editedImage);
+      
+      // Update user's remaining edits if on free plan
+      if (user.subscriptionTier === 'free') {
+        user.editsRemaining = Math.max(0, user.editsRemaining - 1);
+      }
+    } catch (err) {
+      const errorObj = errorHandlingService.handleProcessingError(err);
+      setError(errorObj);
+    } finally {
+      setIsProcessing(false);
     }
+  };
 
-    setIsProcessing(true)
+  const handleAdvancedToolComplete = (result) => {
+    if (!result || !selectedImage) return;
     
-    // Simulate AI processing
-    await new Promise(resolve => setTimeout(resolve, 2000))
-    
+    // Update the image with the processed result
     const editedImage = {
       ...selectedImage,
-      editedUrl: selectedImage.originalUrl, // In real app, this would be the processed image
-      edits: [...selectedImage.edits, { type: editType, settings, timestamp: Date.now() }]
-    }
-
+      editedUrl: result.url || selectedImage.originalUrl,
+      edits: [...selectedImage.edits, { 
+        type: activeAdvancedTool, 
+        timestamp: Date.now() 
+      }]
+    };
+    
     setImages(prev => prev.map(img => 
       img.id === selectedImage.id ? editedImage : img
-    ))
-    setSelectedImage(editedImage)
-    setIsProcessing(false)
-
-    // Update user's remaining edits
-    if (user.subscriptionTier === 'free') {
-      user.editsRemaining = Math.max(0, user.editsRemaining - 1)
-    }
-  }
+    ));
+    setSelectedImage(editedImage);
+    setActiveAdvancedTool(null);
+  };
 
   const handleDownload = (image) => {
-    const link = document.createElement('a')
-    link.href = image.editedUrl || image.originalUrl
-    link.download = `edited_${image.name}`
-    link.click()
-  }
-
-  const handleShare = (image) => {
-    if (navigator.share) {
-      navigator.share({
-        title: 'Edited with PixelPerfect AI',
-        url: image.editedUrl || image.originalUrl
-      })
-    } else {
-      // Fallback for browsers without native sharing
-      alert('Sharing feature coming soon!')
-    }
-  }
+    const link = document.createElement('a');
+    link.href = image.editedUrl || image.originalUrl;
+    link.download = `edited_${image.name}`;
+    link.click();
+  };
 
   const tabs = [
     { id: 'single', label: 'Single Edit', icon: <ImageIcon className="w-4 h-4" /> },
     { id: 'batch', label: 'Batch Edit', icon: <Grid className="w-4 h-4" /> }
-  ]
+  ];
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
@@ -117,6 +227,16 @@ const ImageEditor = ({ user, onUpgrade, onLogin }) => {
           </div>
         )}
       </div>
+
+      {/* Error Message */}
+      {error && (
+        <div className="mb-6">
+          <ErrorMessage 
+            error={error}
+            onRetry={() => setError(null)}
+          />
+        </div>
+      )}
 
       {/* Tabs */}
       <div className="flex space-x-1 mb-6">
@@ -156,19 +276,18 @@ const ImageEditor = ({ user, onUpgrade, onLogin }) => {
                     >
                       <Download className="w-4 h-4" />
                     </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => handleShare(selectedImage)}
-                    >
-                      <Share2 className="w-4 h-4" />
-                    </Button>
+                    
+                    <SocialShare 
+                      imageUrl={selectedImage.editedUrl || selectedImage.originalUrl}
+                      title={`Edited with PixelPerfect AI: ${selectedImage.name}`}
+                    />
+                    
                     <Button
                       variant="destructive"
                       size="sm"
                       onClick={() => {
-                        setImages(prev => prev.filter(img => img.id !== selectedImage.id))
-                        setSelectedImage(null)
+                        setImages(prev => prev.filter(img => img.id !== selectedImage.id));
+                        setSelectedImage(null);
                       }}
                     >
                       <Trash2 className="w-4 h-4" />
@@ -183,11 +302,18 @@ const ImageEditor = ({ user, onUpgrade, onLogin }) => {
                     className="w-full max-h-96 object-contain rounded-lg bg-black/20"
                   />
                   {isProcessing && (
-                    <div className="absolute inset-0 bg-black/50 flex items-center justify-center rounded-lg">
-                      <div className="flex items-center gap-3 text-white">
+                    <div className="absolute inset-0 bg-black/50 flex flex-col items-center justify-center rounded-lg">
+                      <div className="flex items-center gap-3 text-white mb-4">
                         <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-white"></div>
                         <span>Processing with AI...</span>
                       </div>
+                      <div className="w-64 bg-white/20 rounded-full h-2 mb-1">
+                        <div 
+                          className="bg-blue-500 h-2 rounded-full transition-all duration-300"
+                          style={{ width: `${progress}%` }}
+                        ></div>
+                      </div>
+                      <div className="text-xs text-white/70">{progress}%</div>
                     </div>
                   )}
                 </div>
@@ -240,13 +366,30 @@ const ImageEditor = ({ user, onUpgrade, onLogin }) => {
 
           {/* Edit Panel */}
           <div className="lg:col-span-1">
-            <EditPanel
-              selectedImage={selectedImage}
-              onApplyEdit={handleEditApply}
-              user={user}
-              onUpgrade={onUpgrade}
-              isProcessing={isProcessing}
-            />
+            {activeAdvancedTool === 'upscaler' ? (
+              <Upscaler 
+                imageFile={selectedImage?.file}
+                onComplete={handleAdvancedToolComplete}
+                onCancel={() => setActiveAdvancedTool(null)}
+                onUpgrade={onUpgrade}
+              />
+            ) : activeAdvancedTool === 'smartCrop' ? (
+              <SmartCrop 
+                imageFile={selectedImage?.file}
+                onComplete={handleAdvancedToolComplete}
+                onCancel={() => setActiveAdvancedTool(null)}
+                onUpgrade={onUpgrade}
+              />
+            ) : (
+              <EditPanel
+                selectedImage={selectedImage}
+                onApplyEdit={handleEditApply}
+                user={user}
+                onUpgrade={onUpgrade}
+                isProcessing={isProcessing}
+                onAdvancedToolSelect={setActiveAdvancedTool}
+              />
+            )}
           </div>
         </div>
       ) : (
@@ -258,7 +401,8 @@ const ImageEditor = ({ user, onUpgrade, onLogin }) => {
         />
       )}
     </div>
-  )
-}
+  );
+};
 
-export default ImageEditor
+export default ImageEditor;
+
