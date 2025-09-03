@@ -1,10 +1,15 @@
-import React, { useState } from 'react'
-import { Grid, Download, Trash2, Settings, Play, Pause } from 'lucide-react'
-import Button from './ui/Button'
-import ImageUploader from './ImageUploader'
+import React, { useState } from 'react';
+import { Grid, Download, Trash2, Settings, Play, Pause, AlertCircle } from 'lucide-react';
+import { useAuth } from '../context/AuthContext';
+import Button from './ui/Button';
+import ImageUploader from './ImageUploader';
+import ErrorMessage from './common/ErrorMessage';
+import imageProcessingService from '../services/imageProcessing';
+import errorHandlingService from '../services/errorHandling';
 
-const BatchEditor = ({ images, onUpload, user, onUpgrade }) => {
-  const [selectedImages, setSelectedImages] = useState([])
+const BatchEditor = ({ images, onUpload, onUpgrade }) => {
+  const { user } = useAuth();
+  const [selectedImages, setSelectedImages] = useState([]);
   const [batchSettings, setBatchSettings] = useState({
     removeBackground: false,
     autoEnhance: false,
@@ -14,71 +19,116 @@ const BatchEditor = ({ images, onUpload, user, onUpgrade }) => {
       contrast: 0,
       saturation: 0
     }
-  })
-  const [isProcessing, setIsProcessing] = useState(false)
-  const [processedCount, setProcessedCount] = useState(0)
+  });
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [processedCount, setProcessedCount] = useState(0);
+  const [error, setError] = useState(null);
 
   const handleImageSelect = (imageId) => {
     setSelectedImages(prev => 
       prev.includes(imageId)
         ? prev.filter(id => id !== imageId)
         : [...prev, imageId]
-    )
-  }
+    );
+  };
 
   const handleSelectAll = () => {
     if (selectedImages.length === images.length) {
-      setSelectedImages([])
+      setSelectedImages([]);
     } else {
-      setSelectedImages(images.map(img => img.id))
+      setSelectedImages(images.map(img => img.id));
     }
-  }
+  };
 
   const handleBatchProcess = async () => {
     if (!user) {
-      alert('Please sign in to use batch editing')
-      return
+      alert('Please sign in to use batch editing');
+      return;
     }
 
     if (user.subscriptionTier === 'free') {
-      onUpgrade()
-      return
+      onUpgrade();
+      return;
     }
 
     if (selectedImages.length === 0) {
-      alert('Please select images to process')
-      return
+      alert('Please select images to process');
+      return;
     }
 
-    setIsProcessing(true)
-    setProcessedCount(0)
-
-    // Simulate batch processing
-    for (let i = 0; i < selectedImages.length; i++) {
-      await new Promise(resolve => setTimeout(resolve, 1500))
-      setProcessedCount(i + 1)
+    setIsProcessing(true);
+    setProcessedCount(0);
+    setError(null);
+    
+    try {
+      // Get the selected images
+      const imagesToProcess = images.filter(img => selectedImages.includes(img.id));
+      
+      // Process each image
+      for (let i = 0; i < imagesToProcess.length; i++) {
+        const image = imagesToProcess[i];
+        
+        try {
+          // Apply the batch settings
+          if (batchSettings.removeBackground) {
+            await imageProcessingService.removeBackground(image.file);
+          }
+          
+          if (batchSettings.autoEnhance) {
+            await imageProcessingService.enhanceImage(image.file);
+          }
+          
+          if (batchSettings.filter !== 'none') {
+            await imageProcessingService.applyFilter(image.file, batchSettings.filter);
+          }
+          
+          if (Object.values(batchSettings.adjustments).some(value => value !== 0)) {
+            await imageProcessingService.applyAdjustments(image.file, batchSettings.adjustments);
+          }
+          
+          // Update progress
+          setProcessedCount(i + 1);
+        } catch (err) {
+          console.error(`Error processing image ${image.name}:`, err);
+          // Continue with next image
+        }
+      }
+      
+      alert(`Successfully processed ${processedCount} images!`);
+    } catch (err) {
+      const errorObj = errorHandlingService.handleProcessingError(err);
+      setError(errorObj);
+    } finally {
+      setIsProcessing(false);
     }
-
-    setIsProcessing(false)
-    alert(`Successfully processed ${selectedImages.length} images!`)
-  }
+  };
 
   const handleDownloadAll = () => {
     selectedImages.forEach(imageId => {
-      const image = images.find(img => img.id === imageId)
+      const image = images.find(img => img.id === imageId);
       if (image) {
-        const link = document.createElement('a')
-        link.href = image.editedUrl || image.originalUrl
-        link.download = `batch_edited_${image.name}`
-        link.click()
+        const link = document.createElement('a');
+        link.href = image.editedUrl || image.originalUrl;
+        link.download = `batch_edited_${image.name}`;
+        link.click();
       }
-    })
-  }
+    });
+  };
 
-  const canUseBatch = user && user.subscriptionTier !== 'free'
+  const canUseBatch = user && user.subscriptionTier !== 'free';
 
   return (
     <div className="space-y-6">
+      {/* Error Message */}
+      {error && (
+        <div className="mb-6">
+          <ErrorMessage 
+            error={error}
+            onRetry={() => setError(null)}
+          />
+        </div>
+      )}
+      
       {/* Upload Area */}
       {images.length === 0 && (
         <ImageUploader onUpload={onUpload} multiple={true} />
@@ -283,7 +333,8 @@ const BatchEditor = ({ images, onUpload, user, onUpgrade }) => {
         </div>
       )}
     </div>
-  )
-}
+  );
+};
 
-export default BatchEditor
+export default BatchEditor;
+
